@@ -22,4 +22,6 @@ pub enum CustomError {
     InsufficientLiquidity,
     #[msg("Unauthorized")]
     Unauthorized,
+    #[msg("Calculation failure")]
+    CalculationFailure,
 }

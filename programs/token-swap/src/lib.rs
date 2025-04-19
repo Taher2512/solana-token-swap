@@ -1,6 +1,6 @@
-use anchor_lang::prelude::*;
+use anchor_lang::prelude::{borsh::de, *};
 
-use anchor_spl::token_interface::{transfer_checked, mint_to, burn, Burn, Mint, TokenAccount, TokenInterface, TransferChecked, MintTo};
+use anchor_spl::{associated_token::AssociatedToken, token_interface::{burn, mint_to, transfer_checked, sync_native as native_sync_native, SyncNative as NativeSyncNative, Burn, Mint, MintTo, TokenAccount, TokenInterface, TransferChecked}};
 use crate::error::CustomError;
 
 pub mod error;
@@ -9,6 +9,8 @@ declare_id!("AxqzHPnPm5Es17u3PuNHTvU2ivgYvZbzFgEgPiaH7Vj8");
 
 #[program]
 pub mod token_swap {
+    use anchor_lang::Result;
+
     use super::*;
 
     pub fn initialize_pool(
@@ -16,12 +18,23 @@ pub mod token_swap {
         fee_rate: u64,
         bump: u8,
     ) -> Result<()> {
+        msg!("Initializing token swap pool with simplified access");
+    
+        // Validate fee rate
         require!(fee_rate <= 1000, CustomError::FeeTooHigh);
-
+        
+        // Get a reference to the swap pool
         let swap_pool = &mut ctx.accounts.swap_pool;
-        swap_pool.token_a_mint = ctx.accounts.token_a_mint.key();
-        swap_pool.token_b_mint = ctx.accounts.token_b_mint.key();
-        swap_pool.token_a_vault = ctx.accounts.token_a_vault.key();
+        
+        // Copy data from accounts to the swap pool one by one very carefully
+        let token_a_mint = ctx.accounts.token_a_mint.to_account_info().key();
+        msg!("Token A mint key copied: {}", token_a_mint);
+        swap_pool.token_a_mint = token_a_mint;
+        
+        let token_b_mint = ctx.accounts.token_b_mint.to_account_info().key();
+        msg!("Token B mint key copied: {}", token_b_mint);
+        swap_pool.token_b_mint = token_b_mint;
+        
         swap_pool.token_b_vault = ctx.accounts.token_b_vault.key();
         swap_pool.lp_mint = ctx.accounts.lp_mint.key();
         swap_pool.pool_authority = ctx.accounts.pool_authority.key();
@@ -31,7 +44,9 @@ pub mod token_swap {
         swap_pool.admin = ctx.accounts.admin.key();
         swap_pool.total_fees_a = 0;
         swap_pool.total_fees_b = 0;
-
+        
+        msg!("Token swap pool initialized");
+    
         Ok(())
     }
 
@@ -99,10 +114,11 @@ pub mod token_swap {
             },
             signer,
         );
-        mint_to {
+
+        mint_to (
            mint_lp_ctx,
            initial_lp_tokens, 
-        };
+        );
         
         Ok(())
     }
@@ -137,7 +153,7 @@ pub mod token_swap {
             require!(amount_b >= amount_b_min, CustomError::SlippageExceeded);
             (amount_a, amount_b)
         } else {
-            let amount_a = (amount_b_desired as u128)
+            let amount_a_optimal = (amount_b_desired as u128)
                 .checked_mul(reserve_a as u128)
                 .unwrap()
                 .checked_div(reserve_b as u128)
@@ -216,10 +232,11 @@ pub mod token_swap {
             },
             signer
         );
-        mint_to {
+
+        mint_to (
             mint_lp_ctx,
             lp_to_mint,
-        }?;
+        )?;
 
         Ok(())
     }
@@ -461,21 +478,271 @@ pub mod token_swap {
 
         Ok(())
     }
+
+    pub fn set_paused(ctx: Context<AdminAction>, paused: bool) -> Result<()> {
+        require!(ctx.accounts.admin.key() == ctx.accounts.swap_pool.admin, CustomError::Unauthorized);
+
+        ctx.accounts.swap_pool.is_paused = paused;
+        Ok(())
+    }
+
+    pub fn update_fee_rate(ctx: Context<AdminAction>, new_fee_rate: u64) -> Result<()> {
+        require!(ctx.accounts.admin.key() == ctx.accounts.swap_pool.admin, CustomError::Unauthorized);
+        require!(new_fee_rate <= 1000, CustomError::FeeTooHigh); // Max fee of 10%
+
+        ctx.accounts.swap_pool.fee_rate = new_fee_rate;
+        Ok(())
+    }
+
+    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+        require!(ctx.accounts.admin.key() == ctx.accounts.swap_pool.admin, CustomError::Unauthorized);
+
+        ctx.accounts.swap_pool.admin = new_admin;
+        Ok(())
+    }
+
+    // Get token prices
+    pub fn get_token_a_price(ctx: Context<GetPrice>) -> Result<u64> {
+        let token_a_amount = ctx.accounts.token_a_vault.amount;
+        let token_b_amount = ctx.accounts.token_b_vault.amount;
+
+        require!(token_a_amount > 0, CustomError::InsufficientLiquidity);
+
+        // Price of toeken A in terms of token B (scaled by 10^6 for precision)
+        let price = (token_b_amount as u128)
+            .checked_mul(1_000_000)
+            .unwrap()
+            .checked_div(token_a_amount as u128)
+            .unwrap() as u64;
+
+        Ok(price)
+    }
+    pub fn get_token_b_price(ctx: Context<GetPrice>) -> Result<u64> {
+        let token_a_amount = ctx.accounts.token_a_vault.amount;
+        let token_b_amount = ctx.accounts.token_b_vault.amount;
+
+        require!(token_b_amount > 0, CustomError::InsufficientLiquidity);
+
+        // Price of token B in terms of token A (scaled by 10^6 for precision)
+        let price = (token_a_amount as u128)
+            .checked_mul(1_000_000)
+            .unwrap()
+            .checked_div(token_b_amount as u128)
+            .unwrap() as u64;
+
+        Ok(price)
+    }
+
+    // Get total liquidity of both tokens and current LP supply
+    pub fn get_pool_stats(ctx: Context<GetPoolStats>) -> Result<(u64, u64, u64)> {
+        let token_a_amount = ctx.accounts.token_a_vault.amount;
+        let token_b_amount = ctx.accounts.token_b_vault.amount;
+        let lp_supply = ctx.accounts.lp_mint.supply;
+
+        Ok((token_a_amount, token_b_amount, lp_supply))
+    }
+
+    // Calculate swap result without executing it
+    pub fn calculate_swap_result(ctx: Context<GetPrice>, amount_in: u64, is_a_to_b: bool) -> Result<(u64)> {
+        let swap_pool = &ctx.accounts.swap_pool;
+        
+        let source_amount = if is_a_to_b {
+            ctx.accounts.token_a_vault.amount
+        } else {
+            ctx.accounts.token_b_vault.amount
+        };
+
+        let destination_amount = if is_a_to_b {
+            ctx.accounts.token_b_vault.amount
+        } else {
+            ctx.accounts.token_a_vault.amount
+        };
+
+        let new_source_amount = source_amount.checked_add(amount_in).ok_or(error::CustomError::CalculationFailure)?;
+
+        let constant_product = source_amount.checked_mul(destination_amount).ok_or(error::CustomError::CalculationFailure)?;
+
+        let new_destination_amount = constant_product.checked_div(new_source_amount).ok_or(error::CustomError::CalculationFailure)?;
+
+        let output_amount = destination_amount.checked_sub(new_destination_amount).ok_or(error::CustomError::CalculationFailure)?;
+
+        let fee_amount = output_amount.checked_mul(swap_pool.fee_rate).ok_or(CustomError::CalculationFailure)?.checked_div(10000).ok_or(CustomError::CalculationFailure)?;
+
+        let final_output_amount = output_amount.checked_sub(fee_amount).ok_or(CustomError::CalculationFailure)?;
+
+        Ok(final_output_amount)
+    }
+
+    // Function to get the latest trade volume (could be expanded with more tracking in SwapPool)
+    pub fn get_pool_volume(_ctx: Context<GetPoolStats>) -> Result<(u64, u64)> {
+        // This would need additional state tracking in the SwapPool account
+        // For now, returns zeros as placeholder
+        // To implement properly, add volume tracking to the SwapPool struct
+        // and update it in the swap function
+        Ok((0, 0))
+    }
+
+    pub fn get_user_pool_share(ctx: Context<GetUserShare>) -> Result<(u64, u64, u64)> {
+        let token_a_vault_amount = ctx.accounts.token_a_vault.amount;
+        let token_b_vault_amount = ctx.accounts.token_b_vault.amount;
+        let lp_total_supply = ctx.accounts.lp_mint.supply;
+        let user_lp_balance = ctx.accounts.user_lp_token.amount;
+
+        // Calculate user's share in percentage (scaled by 10^6 for precision)
+        let user_share_percentage = if lp_total_supply == 0 {
+            0
+        } else {
+            (user_lp_balance as u128)
+                .checked_mul(1_000_000)
+                .unwrap()
+                .checked_div(lp_total_supply as u128)
+                .unwrap() as u64
+        };
+
+        // Calculate user's share of tokens
+        let user_token_a_share = if lp_total_supply == 0 {
+            0
+        } else {
+            (user_lp_balance as u128)
+                .checked_mul(token_a_vault_amount as u128)
+                .unwrap()
+                .checked_div(lp_total_supply as u128)
+                .unwrap() as u64
+        };
+        let user_token_b_share = if lp_total_supply == 0 {
+            0
+        } else {
+            (user_lp_balance as u128)
+                .checked_mul(token_b_vault_amount as u128)
+                .unwrap()
+                .checked_div(lp_total_supply as u128)
+                .unwrap() as u64
+        };
+
+        Ok((user_share_percentage, user_token_a_share, user_token_b_share))
+    }
+
+    // Function to create wrapper for sync native instruction (for SOL pools)
+    pub fn sync_native(ctx: Context<SyncNative>) -> Result<()> {
+        require!(!ctx.accounts.swap_pool.is_paused, CustomError::PoolPaused);
+
+        // This is used when one of the tokens is wrapped SOL
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            NativeSyncNative {
+                account: ctx.accounts.token_account.to_account_info(),
+            },
+        );
+
+        native_sync_native(cpi_ctx)?;
+
+        Ok(())
+    }
+
+    // Function to update pool implementation (for future upgrades)
+    pub fn update_pool_version(ctx: Context<AdminAction>, _new_version: u8) -> Result<()> {
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.swap_pool.admin,
+            CustomError::Unauthorized
+        );
+        
+        // This is a placeholder for future upgradability
+        // Add version field to SwapPool struct to track upgrades
+        // For now, this just verifies admin authority
+        
+        Ok(())
+    }
 }
 
-
+#[account]
+#[derive(InitSpace)]
+pub struct SwapPool {
+    pub token_a_mint: Pubkey,       // Mint address of token A
+    pub token_b_mint: Pubkey,       // Mint address of token B
+    pub token_a_vault: Pubkey,      // Vault holding token A liquidity
+    pub token_b_vault: Pubkey,      // Vault holding token B liquidity
+    pub lp_mint: Pubkey,            // Mint for LP tokens
+    pub pool_authority: Pubkey,     // PDA with authority over vaults
+    pub fee_rate: u64,              // Fee taken on swaps (basis points)
+    pub bump: u8,                   // Bump for PDA derivation
+    pub is_paused: bool,            // Emergency pause flag
+    pub admin: Pubkey,              // Admin address that can pause/unpause
+    pub total_fees_a: u64,          // Accumulated fees in token A
+    pub total_fees_b: u64,          // Accumulated fees in token B
+}
 
 #[derive(Accounts)]
+#[instruction(fee_rate: u64, bump: u8)]
 pub struct InitializePool<'info> {
     #[account(
         init,
-        payer = payer,
-        space = 8 + SwapPool::INIT_SPACE,
+        payer = admin,
+        space = 8 + 32 + 32 + 32 + 32 + 32 + 32 + 8 +  1 +  1 +  32 + 8 + 8,
     )]
     pub swap_pool: Account<'info, SwapPool>,
 
     pub token_a_mint: InterfaceAccount<'info, Mint>,
     pub token_b_mint: InterfaceAccount<'info, Mint>,
+
+    // #[account(
+    //     mut,
+    //     constraint = token_a_vault.mint == token_a_mint.key(),
+    //     constraint = token_a_vault.owner == pool_authority.key(),
+    // )]
+    // pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    // #[account(
+    //     mut,
+    //     constraint = token_b_vault.mint == token_b_mint.key(),
+    //     constraint = token_b_vault.owner == pool_authority.key(),
+    // )]
+    // pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    // #[account(
+    //     init,
+    //     payer = admin,
+    //     seeds = [
+    //         b"token_vault".as_ref(),
+    //         pool_authority.key().as_ref(),
+    //         token_a_mint.key().as_ref(),
+    //     ],
+    //     bump,
+    //     token::mint = token_a_mint,
+    //     token::authority = pool_authority,
+    // )]
+    // pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    // #[account(
+    //     init,
+    //     payer = admin,
+    //     seeds = [
+    //         b"token_vault".as_ref(),
+    //         pool_authority.key().as_ref(),
+    //         token_b_mint.key().as_ref(),
+    //     ],
+    //     bump,
+    //     token::mint = token_b_mint,
+    //     token::authority = pool_authority,
+    // )]
+    // pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    // #[account(
+    //     init, 
+    //     payer = admin,
+    //     associated_token::mint = token_a_mint,
+    //     associated_token::authority = pool_authority,
+    //     associated_token::token_program = token_program,
+    //   )]
+    //   pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+      
+    //   #[account(
+    //     init, 
+    //     payer = admin,
+    //     associated_token::mint = token_b_mint,
+    //     associated_token::authority = pool_authority,
+    //     associated_token::token_program = token_program,
+    //   )]
+    //   pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         constraint = token_a_vault.mint == token_a_mint.key(),
@@ -490,33 +757,101 @@ pub struct InitializePool<'info> {
     pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
+        init,
+        payer = admin,
+        mint::decimals = 6,
+        mint::authority = pool_authority,
+    )]
+    pub lp_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
         seeds = [
             b"pool_authority".as_ref(),
             token_a_mint.key().as_ref(),
             token_b_mint.key().as_ref(),
         ],
-        bump,
+        bump = bump,
     )]
     /// CHECK: PDA that will have authority over the token vaults
     pub pool_authority: UncheckedAccount<'info>,
 
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
-#[account]
-#[derive(InitSpace)]
-pub struct SwapPool {
-    pub token_a_mint: Pubkey,
-    pub token_b_mint: Pubkey,
-    pub token_a_vault: Pubkey,
-    pub token_b_vault: Pubkey,
-    pub pool_authority: Pubkey,
-    pub fee_rate: u64,
-    pub bump: u8,
+#[derive(Accounts)]
+pub struct AddInitialLiquidity<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+
+    pub token_a_mint: InterfaceAccount<'info, Mint>,
+    pub token_b_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key(),
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key(),
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = user_token_a.mint == swap_pool.token_a_mint,
+        constraint = user_token_a.owner == user_authority.key(),
+    )]
+    pub user_token_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = user_token_b.mint == swap_pool.token_b_mint,
+        constraint = user_token_b.owner == user_authority.key(),
+    )]
+    pub user_token_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = lp_mint.key() == swap_pool.lp_mint,
+    )]
+    pub lp_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        init_if_needed,
+        payer = user_authority,
+        associated_token::mint = lp_mint,
+        associated_token::authority = user_authority,
+    )]
+    pub user_lp_token: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref(),
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub user_authority: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -565,6 +900,333 @@ pub struct Swap<'info> {
     /// CHECK: This is a PDA used as the authority
     pub pool_authority: UncheckedAccount<'info>,
 
+    #[account(mut)]
     pub user_authority: Signer<'info>,
-    pub token_program: Interface<'info, TokenInterface>
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AddLiquidity<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+
+    pub token_a_mint: InterfaceAccount<'info, Mint>,
+    pub token_b_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key(),
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key(),
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = user_token_a.mint == swap_pool.token_a_mint,
+        constraint = user_token_a.owner == user_authority.key(),
+    )]
+    pub user_token_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = user_token_b.mint == swap_pool.token_b_mint,
+        constraint = user_token_b.owner == user_authority.key(),
+    )]
+    pub user_token_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = lp_mint.key() == swap_pool.lp_mint
+    )]
+    pub lp_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        init_if_needed,
+        payer = user_authority,
+        associated_token::mint = lp_mint,
+        associated_token::authority = user_authority,
+    )]
+    pub user_lp_token: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref(),
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub user_authority: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct RemoveLiquidity<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+    
+    pub token_a_mint: InterfaceAccount<'info, Mint>,
+    pub token_b_mint: InterfaceAccount<'info, Mint>,
+    
+    #[account(
+        mut,
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key()
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key()
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = user_token_a.mint == swap_pool.token_a_mint,
+        constraint = user_token_a.owner == user_authority.key()
+    )]
+    pub user_token_a: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = user_token_b.mint == swap_pool.token_b_mint,
+        constraint = user_token_b.owner == user_authority.key()
+    )]
+    pub user_token_b: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = lp_mint.key() == swap_pool.lp_mint
+    )]
+    pub lp_mint: InterfaceAccount<'info, Mint>,
+    
+    #[account(
+        mut,
+        constraint = user_lp_token.mint == lp_mint.key(),
+        constraint = user_lp_token.owner == user_authority.key()
+    )]
+    pub user_lp_token: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref()
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+    
+    #[account(mut)]
+    pub user_authority: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CollectFees<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+
+    pub token_a_mint: InterfaceAccount<'info, Mint>,
+    pub token_b_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key()
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key()
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub fee_collector: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = fee_collector_token_a.mint == swap_pool.token_a_mint,
+        constraint = fee_collector_token_a.owner == fee_collector.key()
+    )]
+    pub fee_collector_token_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = fee_collector_token_b.mint == swap_pool.token_b_mint,
+        constraint = fee_collector_token_b.owner == fee_collector.key()
+    )]
+    pub fee_collector_token_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref()
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct AdminAction<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TransferAdmin<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GetPrice<'info> {
+    pub swap_pool: Account<'info, SwapPool>,
+    
+    #[account(
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key()
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key()
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref()
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GetPoolStats<'info> {
+    pub swap_pool: Account<'info, SwapPool>,
+
+    #[account(
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key()
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key()
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        constraint = lp_mint.key() == swap_pool.lp_mint,
+    )]
+    pub lp_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref()
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GetUserShare<'info> {
+    pub swap_pool: Account<'info, SwapPool>,
+
+    #[account(
+        constraint = token_a_vault.mint == swap_pool.token_a_mint,
+        constraint = token_a_vault.owner == pool_authority.key()
+    )]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        constraint = token_b_vault.mint == swap_pool.token_b_mint,
+        constraint = token_b_vault.owner == pool_authority.key()
+    )]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        constraint = lp_mint.key() == swap_pool.lp_mint
+    )]
+    pub lp_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        constraint = user_lp_token.mint == lp_mint.key(),
+        constraint = user_lp_token.owner == user_authority.key()
+    )]
+    pub user_lp_token: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        seeds = [
+            b"pool_authority".as_ref(),
+            swap_pool.token_a_mint.as_ref(),
+            swap_pool.token_b_mint.as_ref()
+        ],
+        bump = swap_pool.bump
+    )]
+    /// CHECK: This is a PDA used as the authority
+    pub pool_authority: UncheckedAccount<'info>,
+    
+    pub user_authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SyncNative<'info> {
+    #[account(mut)]
+    pub swap_pool: Account<'info, SwapPool>,
+    
+    #[account(mut)]
+    pub token_account: InterfaceAccount<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    
+    pub token_program: Interface<'info, TokenInterface>,
 }
